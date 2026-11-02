@@ -555,6 +555,19 @@ let parse_instr mode mem addr =
       (Test(prefix.opsize, o_rax, oimm_resize i prefix.opsize), na)
     | 0xaa -> (Stos reg8_t, na)
     | 0xab -> (Stos prefix.opsize, na)
+    | 0xac | 0xad ->
+      (* Ariadne's separate LODS producer admits four exact default-address
+         long-mode encodings. Reject every other prefix, order and mode. *)
+      let count = Or_error.ok_exn (Word.to_int Word.(na - addr)) in
+      let bytes = List.init count ~f:(fun i ->
+          Char.to_int (g (Addr.memref ~index:i ~scale:`r8 addr))) in
+      let t = match mode, bytes with
+        | X8664, ([0xf3; 0xac] | [0x67;0xf3;0xac]) -> reg8_t
+        | X8664, ([0x66; 0xf3; 0xad] | [0x67;0x66;0xf3;0xad]) -> reg16_t
+        | X8664, ([0xf3; 0xad] | [0x67;0xf3;0xad]) -> reg32_t
+        | X8664, ([0xf3; 0x48; 0xad] | [0x67;0xf3;0x48;0xad]) -> reg64_t
+        | _ -> unimplemented "LODS outside exact repeated long-mode forms" in
+      (Lods t, na)
     | 0xb0 | 0xb1 | 0xb2 | 0xb3 | 0xb4 | 0xb5 | 0xb6
     | 0xb7 -> let (i, na) = parse_imm8 na in
       (Mov(reg8_t, Oreg(rm_extend lor (b1 land 7)), i, None), na)
@@ -711,6 +724,12 @@ let parse_instr mode mem addr =
        | _ ->
          disfailwith (Printf.sprintf "impossible opcode: %02x/%d" b1 r)
       )
+    (* Ariadne source-extension pilot: only the exact unprefixed flag forms. *)
+    | (0xf5 | 0xf8 | 0xf9 | 0xfd) as flag
+      when List.is_empty _pref && Option.is_none prefix.rex && Option.is_none prefix.vex ->
+      let op = if flag = 0xf5 then Cmc else if flag = 0xf8 then Clc
+        else if flag = 0xf9 then Stc else Std in
+      (op, na)
     | 0xfc -> (Cld, na)
     | 0xfe -> let (r, rm, na) = parse_modrmext_addr None na in
       (match r with (* Grp 4 *)

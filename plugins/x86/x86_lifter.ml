@@ -182,24 +182,39 @@ module ToIR = struct
       Bil.((Int na) + (Int offset))
   let jump_target = compute_jump_target
 
-  let string_incr mode t v =
+  (* Explicit AMD long-mode REP address32 contract. Count/index upper lanes
+     remain unchanged when low ECX is zero; each actual iteration writes the
+     low-32 result with architectural zero extension. Intel zero-count behavior
+     is different and is not claimed by this separately selected producer. *)
+  let string_incr ?(address32=false) mode t v =
+    if address32 then
+      let low_value = Bil.(Cast (LOW, 32, Var v)) in
+      let offset = df_to_offset X86 df_e in
+      let step = Bil.(offset * Int (int_of_mode X86 (bytes_of_width t))) in
+      Bil.Move (v, Bil.(Cast (UNSIGNED, 64, low_value + step)))
+    else
     let i n = Bil.Int (int_of_mode mode n) in
     if Type.equal t reg8_t then
       Bil.Move (v, Bil.(Var v + df_to_offset mode df_e))
     else
       Bil.Move (v, Bil.(Var v + (df_to_offset mode df_e * i (bytes_of_width t))))
 
-  let rep_wrap ?check_zf ~mode ~addr:_ ~next:_ stmts =
+  let rep_wrap ?check_zf ?(address32=false) ~mode ~addr:_ ~next:_ stmts =
     let extend = big_int_of_mode mode in
     let zero = extend Word.b0 and one = extend Word.b1 in
     let rcx = match mode with
       | X86 -> R32.rcx
       | X8664 -> R64.rcx in
     let flag = tmp bool_t in
-    let cond = Bil.((var rcx <> int zero) land var flag) in
+    let count = if address32 then Bil.(Cast (LOW, 32, var rcx)) else Bil.var rcx in
+    let zero = if address32 then int_of_mode X86 0 else zero in
+    let one = if address32 then int_of_mode X86 1 else one in
+    let cond = Bil.((count <> int zero) land var flag) in
     let head = Bil.(flag := int Word.b1) in
     let tail =
-      Bil.(rcx := var rcx - int one) :: match check_zf with
+      let value = Bil.(count - int one) in
+      let value = if address32 then Bil.(Cast (UNSIGNED, 64, value)) else value in
+      Bil.(rcx := value) :: match check_zf with
       | None -> []
       | Some x when x = repz -> Bil.[flag := zf_e]
       | Some x when x = repnz -> Bil.[flag := lnot zf_e]
@@ -362,7 +377,7 @@ module ToIR = struct
     if is_zero_count then l
     else Bil.(cf := unknown "bits" bool_t) :: l
 
-  let rec to_ir mode addr next ss pref has_rex has_vex =
+  let rec to_ir ?(address32=false) mode addr next ss pref has_rex has_vex =
     let module R = (val (vars_of_mode mode)) in
     let open R in
     let load = load_s mode ss in (* Need to change this if we want seg_ds <> None *)
@@ -376,8 +391,10 @@ module ToIR = struct
     let mt = type_of_mode mode in
     let rbp_e = Bil.var rbp in
     let rsp_e = Bil.var rsp in
-    let rsi_e = Bil.var rsi in
-    let rdi_e = Bil.var rdi in
+    let string_address v =
+      if address32 then Bil.(Cast (UNSIGNED, 64, Cast (LOW, 32, Var v))) else Bil.var v in
+    let rsi_e = string_address rsi in
+    let rdi_e = string_address rdi in
     let rax_e = Bil.var rax in
     let rdx_e = Bil.var rdx in
     let ah_e = ah_e mode in
@@ -463,15 +480,15 @@ module ToIR = struct
     | Movs(Type.Imm _bits as t) ->
       let stmts =
         store_s mode seg_es t rdi_e (load_s mode seg_es (size_of_typ t) rsi_e)
-        :: string_incr mode t rsi
-        :: string_incr mode t rdi
+        :: string_incr ~address32 mode t rsi
+        :: string_incr ~address32 mode t rdi
         :: []
       in
       if List.is_empty pref then
         stmts
       else if ints_mem pref repz || ints_mem pref repnz then
         (* movs has only rep instruction others just considered to be rep *)
-        rep_wrap ~mode ~addr ~next stmts
+        rep_wrap ~address32 ~mode ~addr ~next stmts
       else
         unimplemented "unsupported prefix for movs"
     | Movzx(t, dst, ts, src) ->
@@ -1243,14 +1260,14 @@ module ToIR = struct
         Bil.Move (src1, op2e t (Oaddr rsi_e))
         :: Bil.Move (src2, op2e_s mode seg_es has_rex t (Oaddr rdi_e))
         :: Bil.Move (tmpres, Bil.(Var src1 - Var src2))
-        :: string_incr mode t rsi
-        :: string_incr mode t rdi
+        :: string_incr ~address32 mode t rsi
+        :: string_incr ~address32 mode t rdi
         :: set_flags_sub t' (Bil.Var src1) (Bil.Var src2) (Bil.Var tmpres)
       in
       begin match pref with
         | [] -> stmts
         | [single] when single = repz || single = repnz ->
-          rep_wrap ~mode ~check_zf:single ~addr ~next stmts
+          rep_wrap ~address32 ~mode ~check_zf:single ~addr ~next stmts
         | _ -> unimplemented "unsupported flags in cmps" end
     | Scas(Type.Imm _bits as t) ->
       let t' = !!t in
@@ -1262,21 +1279,27 @@ module ToIR = struct
         Move (src1, Bil.(Cast (LOW, !!t, Var rax)))
         :: Move (src2, op2e_s mode seg_es has_rex t (Oaddr rdi_e))
         :: Move (tmpres, Bil.(Var src1 - Var src2))
-        :: string_incr mode t rdi
+        :: string_incr ~address32 mode t rdi
         :: set_flags_sub t' (Bil.Var src1) (Bil.Var src2) (Bil.Var tmpres)
       in
       begin match pref with
         | [] -> stmts
         | [single] when single = repz || single = repnz ->
-          rep_wrap ~mode ~check_zf:single ~addr ~next stmts
+          rep_wrap ~address32 ~mode ~check_zf:single ~addr ~next stmts
         | _ -> unimplemented "unsupported flags in scas" end
+    | Lods(Type.Imm _bits as t) ->
+      let stmts = [assn t o_rax (load_s mode None (size_of_typ t) rsi_e);
+                   string_incr ~address32 mode t rsi] in
+      begin match pref with
+        | [single] when single = repz -> rep_wrap ~address32 ~mode ~addr ~next stmts
+        | _ -> unimplemented "LODS requires REP" end
     | Stos(Type.Imm _bits as t) ->
       let stmts = [store_s mode seg_es t rdi_e (op2e t o_rax);
-                   string_incr mode t rdi]
+                   string_incr ~address32 mode t rdi]
       in
       begin match pref with
         | [] -> stmts
-        | [single] when single = repz -> rep_wrap ~mode ~addr ~next stmts
+        | [single] when single = repz -> rep_wrap ~address32 ~mode ~addr ~next stmts
         | _ -> unimplemented "unsupported prefix for stos" end
     | Push(t, o) ->
       let o = if is_small_imm o t then sign_extend_imm o t
@@ -1652,8 +1675,12 @@ module ToIR = struct
             apply_result;
         ];
       ] @ undefine [cf; oF; sf; zf; af; pf]
+    | Clc -> [Bil.Move (cf, exp_false)]
+    | Stc -> [Bil.Move (cf, exp_true)]
+    | Cmc -> [Bil.Move (cf, Bil.lnot cf_e)]
     | Cld ->
       [Bil.Move (df, exp_false)]
+    | Std -> [Bil.Move (df, exp_true)]
     | Leave t when List.is_empty pref -> (* #UD if Lock prefix is used *)
       Bil.Move (rsp, rbp_e)
       ::to_ir mode addr next ss pref has_rex has_vex (Pop(t, o_rbp))
@@ -1675,6 +1702,7 @@ module ToIR = struct
     | Cmps _ ->  unimplemented "to_ir: Cmps"
     | Scas _ ->  unimplemented "to_ir: Scas"
     | Stos _ ->  unimplemented "to_ir: Stos"
+    | Lods _ ->  unimplemented "to_ir: Lods"
     | Retn _ ->  unimplemented "to_ir: Retn"
     | Interrupt _ ->  unimplemented "to_ir: Interrupt"
 
@@ -1686,7 +1714,28 @@ let disasm_instr mode mem addr =
   let has_rex = Option.is_some prefix.rex in
   let has_vex = Option.is_some prefix.vex in
   let (ss, pref) = D.parse_prefixes mode pref op in
-  ToIR.to_ir mode addr na ss pref has_rex has_vex op
+  let address32 = match mode, op with
+    | X8664, (Movs _ | Stos _ | Lods _ | Cmps _ | Scas _)
+      when List.mem pref 0x67 ~equal:Int.equal ->
+      let length = Or_error.ok_exn (Word.to_int Word.(na - addr)) in
+      let bytes = List.init length ~f:(fun i ->
+          let at = Addr.memref ~index:i ~scale:`r8 addr in
+          Or_error.ok_exn (Or_error.bind (Memory.get ~addr:at mem) ~f:Word.to_int)) in
+      let canonical = match bytes with
+        | [0x67; repeat; opcode] ->
+          (repeat = 0xf3 && List.mem [0xa4;0xa5;0xaa;0xab;0xac;0xad] opcode ~equal:Int.equal)
+          || ((repeat = 0xf2 || repeat = 0xf3)
+              && List.mem [0xa6;0xa7;0xae;0xaf] opcode ~equal:Int.equal)
+        | [0x67;0x66;repeat;opcode] | [0x67;repeat;0x48;opcode] ->
+          (repeat = 0xf3 && List.mem [0xa5;0xab;0xad] opcode ~equal:Int.equal)
+          || ((repeat = 0xf2 || repeat = 0xf3)
+              && List.mem [0xa7;0xaf] opcode ~equal:Int.equal)
+        | _ -> false in
+      if not canonical then unimplemented mode "REP address-size outside exact long-mode forms";
+      true
+    | _ -> false in
+  let pref = if address32 then List.filter pref ~f:(fun p -> p <> 0x67) else pref in
+  ToIR.to_ir ~address32 mode addr na ss pref has_rex has_vex op
 
 let insn arch mem insn =
   let mode = match arch with `x86 -> X86 | `x86_64 -> X8664 in

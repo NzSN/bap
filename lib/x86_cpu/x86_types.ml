@@ -119,6 +119,7 @@ type opcode =
   | Cmps of typ
   | Scas of typ
   | Stos of typ
+  | Lods of typ
   | Push of typ * operand
   | Pop of typ * operand
   | Pushf of typ
@@ -148,7 +149,11 @@ type opcode =
   | Imul of typ * (bool * operand) * operand * operand (** typ, (true if one operand form, dst operand), src1, src2 *)
   | Div of typ * operand (** typ, src *)
   | Idiv of typ * operand (** typ, src *)
+  | Clc
+  | Stc
+  | Cmc
   | Cld
+  | Std
   | Rdtsc
   | Cpuid
   | Xgetbv
