@@ -1,0 +1,4 @@
+(test
+ (name test_legacy_xor)
+ (package bap-x86)
+ (libraries bap-std bap-x86.plugin))
